@@ -1,419 +1,327 @@
-# PolyStudio 代码学习计划
+# PolyStudio 多模态 Agent 源码阅读顺序
 
-> 建议周期：10 个学习日  
-> 建议投入：每天 1.5～2.5 小时  
-> 默认基础：了解 Python、TypeScript、React 基础语法  
-> 学习方法：先跑通功能，再追调用链；先理解主干，再阅读具体媒体工具
+这份清单只关注多模态 Agent 开发，不要求了解首页、项目管理、Excalidraw 画布、主题和设置页面。
 
-## 一、学习目标
+## 核心主线
 
-完成本计划后，应能够：
-
-- [ ] 说明 PolyStudio 前端、后端、Agent、工具和画布之间的关系
-- [ ] 独立追踪一次聊天请求从前端到后端再返回画布的完整过程
-- [ ] 理解 LangGraph ReAct Agent 如何选择并调用工具
-- [ ] 理解 SSE 与 WebSocket 在项目中的不同用途
-- [ ] 理解项目、聊天记录和 Excalidraw 数据如何持久化
-- [ ] 理解 Skill 渐进加载与 Workspace 长期记忆机制
-- [ ] 能够添加一个简单工具、接口或前端事件处理逻辑
-
-## 二、项目核心链路
-
-学习期间始终围绕下面这条主线定位代码：
+阅读时始终围绕下面这条调用链：
 
 ```text
-用户输入
-  ↓
-React / ChatInterface
-  ↓ POST /api/chat
-FastAPI / chat router
-  ↓
-AgentService / LangGraph ReAct Agent
-  ↓
-LLM 判断是否调用 Tool
-  ↓
-StreamProcessor 转换为 SSE 事件
-  ↓
-ChatInterface 解析 delta / tool_call / tool_result
-  ↓
-ExcalidrawCanvas 插入图片、视频或 3D 模型
+用户消息
+  -> FastAPI 接收请求
+  -> 创建 LangGraph ReAct Agent
+  -> 组装 LLM、Prompt、Tools
+  -> LLM 决定直接回复或调用工具
+  -> 图片/视频/音频/3D 工具执行
+  -> 工具结果返回 Agent
+  -> Agent 继续推理并生成回复
+  -> StreamProcessor 输出流式事件
 ```
 
-## 三、开始前准备
+## 1. 先看 Agent 总装配点
 
-### 基础知识检查
+文件：[`backend/app/services/agent_service.py`](backend/app/services/agent_service.py)
 
-不熟悉的部分只需先学习基本概念，不必系统学完框架：
+按顺序看：
 
-- Python：异步生成器、`async` / `await`、类型标注
-- FastAPI：路由、Pydantic、`StreamingResponse`、WebSocket
-- React：组件、Props、`useState`、`useEffect`、`useRef`
-- TypeScript：接口、联合类型、可选字段
-- HTTP：JSON 请求、SSE、WebSocket
-- Agent：Prompt、Tool Calling、ReAct 基本循环
+1. 文件顶部导入的各种 Tool。
+2. `create_agent()` 中的 `model = create_llm()`。
+3. `tools = [...]` 工具注册列表。
+4. `skill_service.get_skills_context()`。
+5. `workspace_service.get_workspace_context()`。
+6. `get_full_prompt(...)`。
+7. `create_react_agent(...)`。
+8. `process_chat_stream(...)`。
 
-### 建议准备的学习工具
-
-- 浏览器开发者工具：重点使用 Network 和 Console
-- FastAPI Swagger：`http://localhost:8000/docs`
-- 后端日志：观察 Agent 创建、工具调用和异常
-- 一张自己的调用链笔记图
-
-## 四、10 日学习安排
-
-### 第 1 日：运行项目并建立全局认识
-
-阅读：
-
-1. [`README.md`](README.md)
-2. [`frontend/package.json`](frontend/package.json)
-3. [`backend/requirements.txt`](backend/requirements.txt)
-4. [`frontend/vite.config.ts`](frontend/vite.config.ts)
-
-实践：
-
-- [ ] 启动后端并访问 `/health` 和 `/docs`
-- [ ] 启动前端，进入首页、编辑器和设置页
-- [ ] 在浏览器 Network 中观察 `/api/canvases`
-- [ ] 找到前端 `/api` 和 `/storage` 的代理配置
-- [ ] 记录项目使用的核心框架及其职责
-
-当天产出：
+看完后应先形成这个结构：
 
 ```text
-React + Vite：页面和交互
-Excalidraw：无限画布
-FastAPI：HTTP、SSE、WebSocket 接口
-LangGraph：Agent 编排与工具调用
-本地 JSON / storage：项目和媒体持久化
+Agent = LLM + Prompt + Tools + Skills Context + Workspace Context
 ```
 
-### 第 2 日：理解前后端入口
+第一遍不用进入每个 Tool 的内部实现，只需要知道 Agent 当前具有哪些能力。
+
+## 2. 看 LLM 是如何接入的
 
 阅读顺序：
 
-1. [`frontend/src/main.tsx`](frontend/src/main.tsx)
-2. [`frontend/src/App.tsx`](frontend/src/App.tsx)
-3. [`backend/app/main.py`](backend/app/main.py)
-4. [`backend/app/routers/chat.py`](backend/app/routers/chat.py) 的路由声明部分
+1. [`backend/app/llm/base.py`](backend/app/llm/base.py)
+2. [`backend/app/llm/factory.py`](backend/app/llm/factory.py)
+3. [`backend/app/llm/volcano.py`](backend/app/llm/volcano.py)
+4. [`backend/app/llm/siliconflow.py`](backend/app/llm/siliconflow.py)
 
-重点问题：
+重点定位：
 
-- [ ] 前端如何根据 URL 显示首页、编辑器或设置页？
-- [ ] `canvasId` 和 `page` 参数分别控制什么？
-- [ ] 后端如何注册 `/api` 路由？
-- [ ] `/storage` 如何映射到本地文件？
-- [ ] `/ws/{canvas_id}` 在什么场景下使用？
+- `BaseLLMProvider` 定义了什么统一接口。
+- `create_llm()` 如何读取 `LLM_PROVIDER`。
+- 不同 Provider 如何创建 LangChain 兼容的 `BaseChatModel`。
+- 模型名称、API Key、Base URL 和流式输出参数在哪里配置。
+- 为什么上层 Agent 不需要知道具体使用哪家模型服务。
 
-当天练习：
-
-- 在纸上或笔记中画出“浏览器 → Vite 代理 → FastAPI”的请求路径。
-
-### 第 3 日：项目、消息和画布数据
-
-阅读顺序：
-
-1. [`backend/app/services/history_service.py`](backend/app/services/history_service.py)
-2. [`backend/app/routers/chat.py`](backend/app/routers/chat.py) 中的画布 CRUD
-3. [`frontend/src/components/ChatInterface.tsx`](frontend/src/components/ChatInterface.tsx) 中以下逻辑：
-   - `fetchCanvases`
-   - `saveCanvasToBackend`
-   - `createNewCanvas`
-   - 当前画布切换与保存相关的 `useEffect`
-
-需要掌握的数据结构：
+这里体现的是 Provider 抽象和工厂模式：
 
 ```text
-Canvas
-├── id
-├── name
-├── createdAt
-├── messages
-└── data
-    ├── elements
-    ├── appState
-    └── files
+AgentService -> create_llm() -> 某个 Provider -> BaseChatModel
 ```
 
-实践：
+## 3. 看 Agent Prompt 如何组装
 
-- [ ] 创建一个项目并观察 `backend/storage/chat_history.json`
-- [ ] 修改画布后刷新页面，确认数据恢复过程
-- [ ] 删除项目，确认前端请求和本地 JSON 的变化
-- [ ] 解释旧版 `images` 字段为什么仍然存在
+文件：[`backend/app/services/prompt.py`](backend/app/services/prompt.py)
 
-### 第 4 日：前端如何发送聊天请求
+建议先从文件底部的 `get_full_prompt(...)` 开始，再反向查看它引用的各段 Prompt。
 
-集中阅读 [`frontend/src/components/ChatInterface.tsx`](frontend/src/components/ChatInterface.tsx)：
+重点看：
 
-- 消息相关 TypeScript 类型
-- 输入内容与附件状态
-- 发送消息的处理函数
-- `fetch('/api/chat')`
-- `AbortController`
-- `response.body.getReader()`
-- SSE 文本缓冲和逐行解析
+1. 基础身份和回复规则。
+2. 工具列表如何插入 Prompt。
+3. 图片、视频、3D、音频等工具的调用规则。
+4. Skill 上下文插入位置。
+5. Workspace 身份和记忆插入位置。
+6. Tool 调用前后，模型被要求如何与用户沟通。
 
-重点问题：
-
-- [ ] 前端向后端发送了哪些字段？
-- [ ] 为什么要把历史消息和当前消息分开处理？
-- [ ] 为什么网络数据需要先放进 `buffer`？
-- [ ] 暂停生成时如何终止读取？
-- [ ] `delta` 如何合并到最后一条助手消息？
-
-当天实践：
-
-- 在浏览器 Network 中找到 `/api/chat`，记录请求体和至少一种 SSE 事件。
-
-### 第 5 日：后端聊天主链路
-
-阅读顺序：
-
-1. [`backend/app/routers/chat.py`](backend/app/routers/chat.py) 的 `chat`
-2. [`backend/app/services/agent_service.py`](backend/app/services/agent_service.py) 的 `process_chat_stream`
-3. [`backend/app/services/stream_processor.py`](backend/app/services/stream_processor.py) 的 `process_stream`
-
-跟踪下面的调用关系：
+不要逐字背 Prompt，重点理解它如何约束 Agent 的：
 
 ```text
-POST /api/chat
-  → chat()
-  → stream_and_save()
-  → process_chat_stream()
-  → create_agent()
-  → StreamProcessor.process_stream()
-  → agent.astream()
+能力边界、工具选择、参数生成、执行顺序、最终回复格式
 ```
 
-实践：
+## 4. 精读一个最典型的 Tool
 
-- [ ] 找出用户消息被加入历史的位置
-- [ ] 找出助手文本被累计的位置
-- [ ] 找出工具结果被保存的位置
-- [ ] 找出流结束后项目历史被更新的位置
-- [ ] 写下每个函数的输入、输出和职责
+优先阅读图片生成：
 
-### 第 6 日：SSE 事件和流式处理
+文件：[`backend/app/tools/volcano_image_generation.py`](backend/app/tools/volcano_image_generation.py)
 
-精读 [`backend/app/services/stream_processor.py`](backend/app/services/stream_processor.py)，重点关注：
+按顺序定位：
 
-- `process_stream`
-- `_handle_chunk`
-- `_handle_message_chunk`
-- 工具参数分片的累积
-- `AIMessageChunk` 与 `ToolMessage`
+1. `GenerateVolcanoImageInput`：工具参数模型。
+2. `@tool("generate_volcano_image", args_schema=...)`：注册为 LangChain Tool。
+3. `generate_volcano_image_tool(...)`：Agent 实际调用入口。
+4. 外部图片 API 请求。
+5. `download_and_save_image(...)`：保存生成结果。
+6. 返回给 Agent 的 JSON 字符串。
+7. `EditVolcanoImageInput` 和 `edit_volcano_image_tool(...)`：图片编辑的差异。
 
-整理事件表：
-
-| 事件 | 用途 | 前端处理结果 |
-| --- | --- | --- |
-| `delta` | 助手文本增量 | 追加到消息内容 |
-| `skill_matched` | Agent 命中 Skill | 显示 Skill 标识 |
-| `tool_call` | 开始调用工具 | 显示执行中的工具步骤 |
-| `tool_result` | 工具执行完成 | 更新步骤并提取媒体 URL |
-| `error` | 后端执行异常 | 显示错误状态 |
-| `[DONE]` | 流结束 | 停止读取和加载状态 |
-
-实践：
-
-- [ ] 从后端的一种事件出发，定位前端对应的 `switch` 分支
-- [ ] 解释工具参数为什么可能需要跨多个 chunk 拼接
-- [ ] 解释 SSE 为什么适合当前聊天响应
-
-### 第 7 日：Agent、Prompt 和模型工厂
-
-阅读顺序：
-
-1. [`backend/app/services/agent_service.py`](backend/app/services/agent_service.py) 的 `create_agent`
-2. [`backend/app/services/prompt.py`](backend/app/services/prompt.py)
-3. [`backend/app/llm/factory.py`](backend/app/llm/factory.py)
-4. [`backend/app/llm/base.py`](backend/app/llm/base.py)
-5. [`backend/app/llm/volcano.py`](backend/app/llm/volcano.py)
-6. [`backend/app/llm/siliconflow.py`](backend/app/llm/siliconflow.py)
-
-重点问题：
-
-- [ ] 工具列表在哪里注册？
-- [ ] 工具的名称、描述和参数如何提供给模型？
-- [ ] Prompt 由哪些部分拼装而成？
-- [ ] `create_react_agent` 的模型、工具和 Prompt 分别负责什么？
-- [ ] `LLM_PROVIDER` 如何决定具体模型实现？
-
-当天产出：
-
-用自己的话描述一次 ReAct 循环：
+重点理解一个 Tool 的标准结构：
 
 ```text
-模型读取用户需求 → 判断调用工具 → 生成工具参数 →
-执行工具 → 读取工具结果 → 继续调用或生成最终回复
+Pydantic 参数模型
+  -> @tool 名称和描述
+  -> 参数预处理
+  -> 调用外部模型 API
+  -> 保存媒体结果
+  -> 返回结构化 JSON
 ```
 
-### 第 8 日：追踪一个完整媒体工具
+`@tool` 的函数名、描述、参数字段和字段说明都会影响 LLM 是否会调用它，以及能否生成正确参数。
 
-优先选择图片生成，阅读：
+## 5. 看聊天请求如何进入 Agent
 
-1. [`backend/app/tools/volcano_image_generation.py`](backend/app/tools/volcano_image_generation.py)
-2. [`backend/app/services/agent_service.py`](backend/app/services/agent_service.py) 中的工具注册
-3. [`backend/app/services/stream_processor.py`](backend/app/services/stream_processor.py) 中的工具结果处理
-4. [`frontend/src/components/ChatInterface.tsx`](frontend/src/components/ChatInterface.tsx) 中的 `tool_result` 分支
-5. [`frontend/src/components/ExcalidrawCanvas.tsx`](frontend/src/components/ExcalidrawCanvas.tsx) 中的 `addImage`
+文件：[`backend/app/routers/chat.py`](backend/app/routers/chat.py)
 
-完整链路：
+只需要看：
+
+1. `ChatRequest`。
+2. `@router.post("/chat")`。
+3. 历史消息与本轮用户消息的拼接。
+4. `process_chat_stream(messages, request.session_id)`。
+5. `StreamingResponse`。
+
+图片、音频、视频上传接口和画布历史保存可以先跳过。
+
+这一层只负责把 HTTP 请求转换为 Agent 可以处理的消息：
 
 ```text
-自然语言需求
-  → generate_volcano_image_tool
-  → 外部图片 API
-  → 保存到 storage/images
-  → tool_result.image_url
-  → ChatInterface
-  → ExcalidrawCanvas.addImage
+POST /api/chat JSON
+  -> ChatRequest
+  -> messages
+  -> process_chat_stream(...)
 ```
 
-实践：
+## 6. 看 LangGraph 输出如何变成流式事件
 
-- [ ] 记录工具输入参数和返回 JSON
-- [ ] 找到公网 URL、本地路径和 `/storage` URL 的转换位置
-- [ ] 找到生成结果插入画布的位置
-- [ ] 解释工具异常如何传回前端
+文件：[`backend/app/services/stream_processor.py`](backend/app/services/stream_processor.py)
 
-完成图片链路后，再按兴趣选读一种工具：
+按顺序看：
 
-- 视频：`backend/app/tools/volcano_video_generation.py`
-- 3D：`backend/app/tools/model_3d_generation.py`
-- TTS：`backend/app/tools/qwen_tts.py`
-- 多模态理解：`backend/app/tools/qwen_omni_understanding.py`
-- 虚拟人：`backend/app/tools/virtual_anchor_generation.py`
-- 音频处理：`backend/app/tools/audio_mixing.py`
+1. `StreamProcessor.__init__()` 中保存的流状态。
+2. `process_stream(...)`。
+3. `agent.astream(...)`。
+4. `_handle_chunk(...)`。
+5. `_handle_message_chunk(...)`。
+6. `AIMessageChunk` 的文本和工具调用处理。
+7. `ToolMessage` 的工具结果处理。
+8. 工具参数分片的累积逻辑。
 
-### 第 9 日：Skill 与 Workspace 记忆
+重点掌握这些事件：
+
+| 事件 | 含义 |
+| --- | --- |
+| `delta` | LLM 生成的一小段文本 |
+| `tool_call` | LLM 决定调用某个工具及其参数 |
+| `tool_result` | 工具执行后返回的结果 |
+| `skill_matched` | Agent 判断应加载某个 Skill |
+| `error` | Agent、模型或工具执行异常 |
+| `[DONE]` | 本轮流式响应结束 |
+
+这部分代码较复杂。第一遍只追踪一种文本 `delta` 和一次完整的 `tool_call -> tool_result`，之后再看参数分片兼容逻辑。
+
+## 7. 看前端如何消费 Agent 事件
+
+文件：[`frontend/src/components/ChatInterface.tsx`](frontend/src/components/ChatInterface.tsx)
+
+只搜索并阅读：
+
+1. `sendMessage`。
+2. `fetch('/api/chat')`。
+3. `response.body?.getReader()`。
+4. `reader.read()`。
+5. `switch (event.type)`。
+6. `delta`、`tool_call`、`tool_result`、`error` 分支。
+
+不需要阅读画布管理、项目列表和 Excalidraw 代码。
+
+这一小段前端代码的价值是帮助理解 Agent API 对外暴露的事件协议，而不是学习 React 页面开发。
+
+## 8. 看真正的多模态理解 Tool
+
+文件：[`backend/app/tools/qwen_omni_understanding.py`](backend/app/tools/qwen_omni_understanding.py)
+
+按顺序定位：
+
+1. `QwenOmniUnderstandInput`。
+2. `qwen_omni_understand_tool(...)`。
+3. `_resolve_local_path(...)`。
+4. `_detect_media_type(...)` 和 `_get_mime(...)`。
+5. `_encode_file_to_base64(...)`。
+6. `_call_qwen_omni(...)`。
+7. 文本和音频结果如何返回。
+
+重点理解：
+
+```text
+本地路径或 URL
+  -> 判断图片/音频/视频类型
+  -> 转换成模型 API 需要的输入格式
+  -> 调用多模态模型
+  -> 返回文本理解结果或音频结果
+```
+
+这里的“多模态理解”和图片生成不同：前者让模型理解已有媒体，后者根据指令创造新媒体。
+
+## 9. 按模态扩展阅读其他 Tool
+
+在看懂一个图片 Tool 后，按兴趣选择，不需要全部阅读。
+
+### 图片生成与编辑
+
+- [`backend/app/tools/volcano_image_generation.py`](backend/app/tools/volcano_image_generation.py)
+
+### 视频生成
+
+- [`backend/app/tools/volcano_video_generation.py`](backend/app/tools/volcano_video_generation.py)
+
+重点看任务提交、轮询任务状态、结果下载，以及文本生视频、图片生视频的参数差异。
+
+### 3D 模型生成
+
+- [`backend/app/tools/model_3d_generation.py`](backend/app/tools/model_3d_generation.py)
+
+重点看文本/图片输入、异步任务轮询、压缩包解压，以及 OBJ/GLB 结果组织。
+
+### TTS 和声音克隆
+
+- [`backend/app/tools/qwen_tts.py`](backend/app/tools/qwen_tts.py)
+
+重点看 `VoiceDesignInput`、`VoiceCloningInput`、音频输入准备和 Base64 音频保存。
+
+## 10. 看多工具工作流如何组合
+
+单个 Tool 看懂后，再看需要多步协作的能力。
+
+推荐顺序：
+
+1. [`backend/app/tools/video_concatenation.py`](backend/app/tools/video_concatenation.py)
+2. [`backend/app/tools/audio_mixing.py`](backend/app/tools/audio_mixing.py)
+3. [`backend/app/tools/virtual_anchor_generation.py`](backend/app/tools/virtual_anchor_generation.py)
+
+这些文件体现的不是新 Agent 框架，而是 Agent 如何串联多个原子工具：
+
+```text
+生成多个视频 -> 视频拼接
+生成多段语音 -> 音频拼接 -> 选择 BGM -> 混音
+检测人脸 -> 准备图片和音频 -> 调用虚拟人工作流
+```
+
+阅读时重点关注每个工具的输入输出是否能被下一个工具直接使用。
+
+## 11. 看 Skill 渐进加载
 
 阅读顺序：
 
 1. [`backend/app/services/skill_service.py`](backend/app/services/skill_service.py)
 2. [`backend/app/tools/skill_tools.py`](backend/app/tools/skill_tools.py)
-3. [`backend/skills/public/skill-creator/SKILL.md`](backend/skills/public/skill-creator/SKILL.md)
-4. 任意一个 `backend/skills/custom/*/SKILL.md`
-5. [`backend/app/services/workspace_service.py`](backend/app/services/workspace_service.py)
-6. [`backend/app/tools/workspace_tools.py`](backend/app/tools/workspace_tools.py)
-7. `backend/workspace/` 下的身份和记忆文件
+3. 任意一个 `backend/skills/custom/*/SKILL.md`
+4. 回到 [`backend/app/services/agent_service.py`](backend/app/services/agent_service.py) 看 Skill Context 注入位置。
 
-掌握 Skill 渐进加载流程：
+重点追踪：
 
 ```text
 扫描 SKILL.md 元数据
-  → 将名称和描述注入 Prompt
-  → 模型判断是否匹配
-  → 调用 read_skill_file
-  → 加载完整工作流
-  → 按 Skill 执行任务
+  -> 只把名称、描述和路径加入 Prompt
+  -> LLM 判断是否匹配用户需求
+  -> 调用 read_skill_file
+  -> 加载完整工作流
+  -> 按 Skill 编排多个 Tool
 ```
 
-实践：
+Skill 解决的是复杂任务工作流和领域指令扩展，不是新增底层模型能力。
 
-- [ ] 区分 `public` 和 `custom` Skill
-- [ ] 找到 Skill 启用状态的存储位置
-- [ ] 解释为什么不在启动时加载所有 Skill 全文
-- [ ] 区分 Workspace 身份信息与聊天历史
-- [ ] 找到 Agent 写入长期记忆的工具
+## 12. 最后看 Agent 身份和长期记忆
 
-### 第 10 日：WebSocket、设置页和总结实践
+阅读顺序：
 
-阅读 WebSocket 链路：
+1. [`backend/app/services/workspace_service.py`](backend/app/services/workspace_service.py)
+2. [`backend/app/tools/workspace_tools.py`](backend/app/tools/workspace_tools.py)
+3. `backend/workspace/AGENTS.md`
+4. `backend/workspace/IDENTITY.md`
+5. `backend/workspace/USER.md`
+6. `backend/workspace/SOUL.md`
+7. `backend/workspace/MEMORY.md`
+8. 回到 [`backend/app/services/agent_service.py`](backend/app/services/agent_service.py) 看 Workspace Context 注入位置。
 
-1. [`backend/app/main.py`](backend/app/main.py) 的 `/ws/{canvas_id}`
-2. [`backend/app/services/connection_manager.py`](backend/app/services/connection_manager.py)
-3. [`backend/app/routers/chat.py`](backend/app/routers/chat.py) 中的广播逻辑
-4. [`frontend/src/components/ChatInterface.tsx`](frontend/src/components/ChatInterface.tsx) 中的 WebSocket `useEffect`
-5. [`polystudio-client/SKILL.md`](polystudio-client/SKILL.md)
-
-理解两种流的区别：
-
-| 通道 | 主要场景 | 数据方向 |
-| --- | --- | --- |
-| SSE | 当前页面主动发起聊天 | 当前 HTTP 请求返回事件 |
-| WebSocket | 外部客户端驱动画布 | 后端向订阅画布实时广播 |
-
-有余力再浏览：
-
-- [`frontend/src/components/SettingsPage.tsx`](frontend/src/components/SettingsPage.tsx)
-- [`backend/app/routers/settings.py`](backend/app/routers/settings.py)
-- [`frontend/src/components/Model3DViewer.tsx`](frontend/src/components/Model3DViewer.tsx)
-
-总结实践三选一：
-
-- [ ] 为 `HistoryService` 添加保存、更新、删除测试
-- [ ] 添加一个不依赖外部 API 的简单 Agent Tool
-- [ ] 添加一种 SSE 事件，并完成前后端处理
-
-## 五、大文件阅读策略
-
-以下文件职责较多，不建议从第一行通读到最后一行：
-
-- `frontend/src/components/ChatInterface.tsx`：约 2000 行
-- `frontend/src/components/ExcalidrawCanvas.tsx`：约 1400 行
-- `frontend/src/components/SettingsPage.tsx`：约 1000 行
-
-推荐做法：
-
-1. 先看组件 Props、类型和顶层状态。
-2. 根据具体功能搜索函数名或 API 路径。
-3. 沿一次用户操作追踪相关函数。
-4. 最后再看渲染 JSX 和样式。
-
-例如学习聊天时，只搜索：
+重点理解两条路径：
 
 ```text
-/api/chat
-getReader
-event.type
-tool_result
+Workspace 文件 -> get_workspace_context() -> System Prompt
+Agent 调用 write_memory -> 更新 MEMORY.md -> 后续 Agent 读取
 ```
 
-学习画布时，只搜索：
+这部分实现的是跨会话身份、偏好和长期记忆，与单轮 `messages` 聊天上下文不同。
 
-```text
-addImage
-addVideo
-add3DModelPreview
-onDataChange
-```
+## 最短阅读路径
 
-## 六、学习笔记模板
+如果只想尽快看懂核心 Agent，按下面 8 个入口即可：
 
-每学习一个模块，可以复制下面的模板：
+1. `agent_service.py` 的 `create_agent()`。
+2. `llm/factory.py` 的 `create_llm()`。
+3. `prompt.py` 的 `get_full_prompt()`。
+4. `volcano_image_generation.py` 的参数模型、`@tool` 和工具函数。
+5. `chat.py` 的 `POST /chat`。
+6. `stream_processor.py` 的 `process_stream()`。
+7. `qwen_omni_understanding.py` 的 Tool 入口。
+8. `skill_service.py` 的 `get_skills_context()`。
 
-```markdown
-### 模块名称
+## 可以跳过的代码
 
-- 文件：
-- 职责：
-- 输入：
-- 输出：
-- 上游调用者：
-- 下游依赖：
-- 核心数据结构：
-- 异常处理：
-- 我还不理解的问题：
-```
+如果目标只是学习多模态 Agent，以下内容暂时不需要看：
 
-## 七、最终验收清单
-
-- [ ] 不看代码画出完整聊天调用链
-- [ ] 说清楚 `delta`、`tool_call`、`tool_result` 的产生和消费位置
-- [ ] 说清楚媒体 URL 如何从工具结果进入 Excalidraw
-- [ ] 说清楚画布和消息如何保存、恢复
-- [ ] 说清楚 SSE 与 WebSocket 的职责差异
-- [ ] 说清楚 Agent Prompt、LLM 和 Tools 的关系
-- [ ] 说清楚 Skill 为什么采用渐进加载
-- [ ] 能给一个新功能判断应该放在 router、service、tool 还是 frontend
-- [ ] 完成至少一个小型代码练习
-
-## 八、注意事项
-
-- [`backend/FRAMEWORK.md`](backend/FRAMEWORK.md) 可以帮助理解早期架构，但部分内容落后于当前实现，应以源码为准。
-- 项目目前没有成体系的测试目录。学习过程中补充 `HistoryService`、事件转换等纯逻辑测试，是很合适的入门实践。
-- 图片、视频、3D、TTS 等工具大多依赖外部服务。学习架构时优先关注工具接口、输入输出和事件流，不必一开始研究每家 API 的全部细节。
-- 调试时不要在笔记、截图或提交记录中暴露 `.env` 内的 API Key。
+- `frontend/src/App.tsx`
+- `frontend/src/components/HomePage.tsx`
+- `frontend/src/components/ExcalidrawCanvas.tsx`
+- `frontend/src/components/SettingsPage.tsx`
+- `frontend/src/components/Model3DViewer.tsx`
+- `backend/app/services/history_service.py`
+- `chat.py` 中的画布 CRUD 和文件上传接口
+- `main.py` 中的静态文件挂载和页面相关配置
+- `ChatInterface.tsx` 中除聊天请求和 SSE 解析之外的部分
 

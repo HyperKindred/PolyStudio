@@ -261,42 +261,73 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
     }
   }
 
+  /**
+   * 从后端加载全部画布，并确定进入编辑器后应该显示哪一个项目。
+   *
+   * 该函数同时完成四件事：
+   * 1. 请求后端保存的画布列表；
+   * 2. 将旧版画布结构迁移为当前 Excalidraw 结构；
+   * 3. 根据 URL 和本地记录选择当前画布；
+   * 4. 恢复历史消息，或准备处理从首页带入的首条消息。
+   */
   const fetchCanvases = async () => {
     try {
+      // Vite 开发服务器会把 /api 请求代理到 FastAPI；对应后端 GET /api/canvases。
       const res = await fetch('/api/canvases')
+
+      // fetch() 遇到 404、500 等 HTTP 错误不会自动抛异常，需要手动检查 ok。
+      // res.ok 表示 HTTP 状态码位于 200～299。
       if (res.ok) {
+        // 把响应体中的 JSON 文本异步解析为 JavaScript 数据。
         const data = await res.json()
+
+        // 后端正常应返回 Canvas 数组；这里做运行时检查，并排除空数组。
         if (Array.isArray(data) && data.length > 0) {
+          // map 为每个旧项目生成迁移后的新对象，不直接修改后端返回的原数组。
           const migrated = data.map(migrateLegacyCanvasToExcalidraw)
+
+          // 保存全部画布后会触发 React 重新渲染；状态更新不是同步赋值。
           setCanvases(migrated)
-          // 优先使用本地记录的选中ID，如果不存在则默认选中第一个
+
+          // 按优先级决定要打开的画布：组件参数/URL → 上次访问记录 → 列表首项。
           const urlId = getCanvasIdFromUrl()
           const lastId = localStorage.getItem('ai_agent_current_canvas_id')
+          // || 会返回第一个非空值，因此 initialCanvasId 的优先级最高。
           const preferredId = initialCanvasId || urlId || lastId || ''
+
+          // 记录的画布可能已经被删除；find 找不到时回退到后端列表第一项。
           const target = migrated.find((c: Canvas) => c.id === preferredId) || migrated[0]
           const canvasId = target.id
+
+          // 分别同步组件状态和浏览器 URL，保证刷新或分享链接后仍能打开同一画布。
           setCurrentCanvasId(canvasId)
           setCanvasIdInUrl(canvasId)
           
-          // 检查是否有待发送的消息（从首页来的）
+          // 首页创建项目时会把首条输入临时保存为 pending_prompt:<canvasId>。
+          // sessionStorage 仅在当前浏览器标签页会话中保存，适合页面间传递一次性数据。
           const pendingKey = `pending_prompt:${canvasId}`
           const hasPending = sessionStorage.getItem(pendingKey)
           
-          // 如果有待发送的消息，不设置后端消息，让 useEffect 处理
+          // 有待发送消息时先保持消息列表为空，后面的 useEffect 会读取临时内容、
+          // 显示用户消息并自动调用 sendMessage，避免同时恢复旧消息造成重复。
           if (hasPending) {
             setMessages([])
           } else {
+            // 普通进入已有项目时，恢复后端保存的消息；旧数据缺少字段则使用空数组。
             setMessages(target.messages || [])
           }
         } else {
+          // 后端没有任何历史项目时，为用户创建第一个本地画布。
           createNewCanvas()
         }
       } else {
-        // 如果API失败，尝试创建新画布
+        // HTTP 请求完成但返回错误状态时，仍让页面进入一个可用的新画布。
         createNewCanvas()
       }
     } catch (e) {
+      // 网络失败、响应不是合法 JSON 等异常会进入这里。
       console.error('获取画布失败', e)
+      // 加载历史失败不阻塞整个编辑器，使用空白画布作为降级方案。
       createNewCanvas()
     }
   }
