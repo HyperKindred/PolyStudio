@@ -1,0 +1,10 @@
+schema_version: 1
+module_path: ""
+title: 仓库根契约与外部客户端接入规范
+scope:
+    - .gitignore
+    - polystudio-client/
+    - README.md
+source_files: []
+depends_on: []
+related_to: []

@@ -30,7 +30,6 @@ dist-ssr/
 # IDE
 .vscode/
 .idea/
-.qoder/
 *.swp
 *.swo
 *~

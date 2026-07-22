@@ -1,0 +1,18 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: zh-CN
+branch: main
+nodes_managed: true
+exported_at: "2026-07-22T02:59:24Z"
+modules:
+    "":
+        dir_name: 仓库根契约与外部客户端接入规范
+        title: 仓库根契约与外部客户端接入规范
+        scope:
+            - .gitignore
+            - polystudio-client/
+            - README.md
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []
