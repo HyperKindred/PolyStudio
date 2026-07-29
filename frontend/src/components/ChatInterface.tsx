@@ -16,9 +16,11 @@ type ChatInterfaceProps = {
 }
 
 interface ToolCall {
+  // 后端 tool_call.id 与 tool_result.tool_call_id 使用同一个值，前端靠它关联调用和结果。
   id: string
   name: string
   arguments: any
+  // 收到 tool_call 时为 executing，收到对应 tool_result 后切换为 done。
   status: 'executing' | 'done'
   result?: any
   imageUrl?: string
@@ -453,8 +455,8 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
     isLoadingRef.current = isLoading
   }, [isLoading])
 
-  // WebSocket 连接：订阅当前画布的实时事件
-  // 当 Postman 等外部客户端发送带 canvas_id 的请求时，前端会实时收到消息更新
+  // WebSocket 是“外部请求”的旁路：当 Postman 等客户端向同一 canvas_id 发起聊天时，
+  // 后端会把与 SSE 相同的业务事件广播到这里，让当前页面同步展示生成过程。
   useEffect(() => {
     if (!currentCanvasId) return
 
@@ -466,6 +468,8 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
       setMessages((prev) => {
         const next = [...prev]
         const last = next[next.length - 1]
+        // 连续 delta 拼到最近的纯文本消息；如果前一条是工具步骤，则新建文本消息，
+        // 从而保留“模型文本 -> 工具步骤 -> 模型后续文本”的真实时间顺序。
         if (last && last.role === 'assistant' && (!last.toolCalls || last.toolCalls.length === 0)) {
           next[next.length - 1] = { ...last, content: (last.content || '') + deltaText }
           return next
@@ -478,7 +482,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
     const appendToolStepExternal = (toolCall: ToolCall, attachToSkill = false) => {
       setMessages((prev) => {
         if (attachToSkill) {
-          // 附加到最近一条含 skillMatched 的消息
+          // Skill 工具紧跟 skill_matched 事件，把它附到命中提示上，避免产生重复 UI 行。
           const next = [...prev]
           for (let i = next.length - 1; i >= 0; i--) {
             if (next[i].skillMatched) {
@@ -492,6 +496,8 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
     }
 
     const updateToolStepExternal = (toolCallId: string, updater: (tc: ToolCall) => ToolCall) => {
+      // tool_result 可能在若干条消息之后才到达，因此不能只更新最后一条消息；
+      // 必须扫描消息中的工具步骤，用 tool_call_id 精确找到原调用。
       setMessages((prev) =>
         prev.map((m) => {
           if (!m.toolCalls) return m
@@ -502,8 +508,8 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
     }
 
     ws.onmessage = (e) => {
-      // 防重复：前端自己正在发起 SSE 请求时，忽略 WebSocket 消息
-      // wsExternalActiveRef 为 true 时表示是外部请求驱动的，不应忽略
+      // 当前页面自己发起聊天时，同一事件既会从 SSE 返回，也会被广播到 WebSocket。
+      // 此时忽略 WebSocket 副本；wsExternalActiveRef 表示事件来自别的客户端，应正常展示。
       if (isLoadingRef.current && !wsExternalActiveRef.current) return
 
       try {
@@ -518,6 +524,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
             break
 
           case 'delta':
+            // content 只是本次模型 chunk 的文本增量，需要按到达顺序追加而不是覆盖。
             if (event.content) {
               appendDeltaExternal(event.content)
               setTimeout(() => scrollToBottom('auto'), 0)
@@ -525,7 +532,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
             break
 
           case 'skill_matched':
-            // 命中 skill：显示技能标识消息
+            // 后端在 read_skill_file 的 tool_call 之前发送此事件，先建立 Skill 展示位置。
             setMessages((prev) => [
               ...prev,
               {
@@ -537,7 +544,8 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
             break
 
           case 'tool_call':
-            // read_skill_file / list_skill_dir 附加到 skillMatched 消息，不单独新建
+            // 先创建 executing 状态；真正的工具结果会通过相同 ID 在 tool_result 中补回。
+            // Skill 管理工具附加到 skillMatched 消息，其他工具各自创建独立步骤。
             appendToolStepExternal({
               id: event.id,
               name: event.name,
@@ -547,6 +555,8 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
             break
 
           case 'tool_result':
+            // tool_call_id 对应先前的 tool_call.id。除标记完成外，还从结果中提取
+            // 图片、视频、3D 模型和音频 URL，供消息区域及画布使用。
             updateToolStepExternal(event.tool_call_id, (tc) => {
               let updatedArgs = tc.arguments
               let imageUrl: string | undefined = tc.imageUrl
@@ -611,6 +621,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
             break
 
           case 'done':
+            // WebSocket 不发送 SSE 的 [DONE] 文本，而使用等价的 JSON done 事件。
             wsExternalActiveRef.current = false
             isLoadingRef.current = false
             setIsLoading(false)
@@ -618,6 +629,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
             break
 
           case 'error':
+            // error 是后端规范化后的 Agent、模型或工具异常；收到后结束外部加载状态。
             setMessages((prev) => {
               const next = [...prev]
               const last = next[next.length - 1]
@@ -740,10 +752,12 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
 
       const reader = response.body?.getReader() ?? null
       readerRef.current = reader
+      // reader 给出 Uint8Array；TextDecoder 的 stream 模式能正确处理跨网络块拆开的 UTF-8 字符。
       const decoder = new TextDecoder()
 
       if (!reader) throw new Error('无法读取响应流')
 
+      // 网络 chunk 与 SSE 事件边界并不一致，末尾不完整的一行必须留到下一次 read() 再解析。
       let buffer = ''
       let eventCount = 0
 
@@ -753,6 +767,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
         setMessages((prev) => {
           const next = [...prev]
           const last = next[next.length - 1]
+          // delta 是增量而非完整答案。连续文本追加到同一条消息，工具步骤之后的文本另起一条。
           if (last && last.role === 'assistant' && (!last.toolCalls || last.toolCalls.length === 0)) {
             // 保留所有字段（包括 imageUrls, audioUrls 等）
             next[next.length - 1] = { ...last, content: (last.content || '') + deltaText }
@@ -766,6 +781,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
       const appendToolStep = (toolCall: ToolCall, attachToSkill = false) => {
         setMessages((prev) => {
           if (attachToSkill) {
+            // read_skill_file 等调用在 skill_matched 后到达，复用最近的 Skill 消息承载步骤。
             const next = [...prev]
             for (let i = next.length - 1; i >= 0; i--) {
               if (next[i].skillMatched) {
@@ -786,6 +802,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
       }
 
       const updateToolStep = (toolCallId: string, updater: (tc: ToolCall) => ToolCall) => {
+        // 工具结果按 ID 回填，不依赖消息位置，因此模型在工具前后输出文本也不会关联错。
         setMessages((prev) => {
           const next = prev.map((m) => {
             if (!m.toolCalls) return m
@@ -817,6 +834,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
 
         const chunk = decoder.decode(value, { stream: true })
         buffer += chunk
+        // 只处理已经收齐的行；pop() 取出的最后一段可能是不完整 JSON，继续留在 buffer 中。
         const lines = buffer.split('\n')
         buffer = lines.pop() || ''
 
@@ -824,7 +842,9 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
           if (line.trim() === '') continue
           
           if (line.startsWith('data: ')) {
+            // 后端每条 SSE 为 "data: <payload>\n\n"；这里去掉协议前缀后再解析业务事件。
             const data = line.slice(6).trim()
+            // [DONE] 只表示本轮流自然结束，不是 JSON，也不产生一条聊天消息。
             if (data === '[DONE]') continue
 
             try {
@@ -833,6 +853,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
 
               switch (event.type) {
                 case 'delta':
+                  // 每个 content 都是一小段新文本，按事件到达顺序拼接为完整回答。
                   if (event.content) {
                     appendDelta(event.content)
                     setTimeout(() => scrollToBottom('auto'), 0)
@@ -840,7 +861,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
                   break
 
                 case 'skill_matched':
-                  // 命中 skill：显示技能标识消息
+                  // 先创建 Skill 命中消息，紧随其后的 read_skill_file 会附着到这里。
                   setMessages((prev) => [
                     ...prev,
                     {
@@ -852,7 +873,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
                   break
 
                 case 'tool_call':
-                  // read_skill_file / list_skill_dir 附加到 skillMatched 消息，不单独新建
+                  // 收到的是“模型决定调用工具”，工具此时可能仍在执行，因此先标记 executing。
                   appendToolStep({
                             id: event.id,
                             name: event.name,
@@ -862,12 +883,12 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
                   break
                 
                 case 'tool_call_chunk':
-                  // 处理工具参数流
-                  // 当前 UI 只展示 tool_call 的最终参数；
-                  // 如需做“参数逐字流式展示”，可以在这里增量拼接。
+                  // 后端目前会先累积参数分片，等 JSON 完整后再发送 tool_call；此分支仅兼容
+                  // 可能直传分片的旧协议，当前 UI 不展示尚未完成的参数。
                   break
 
                 case 'tool_result':
+                  // 工具已经执行完成。用 tool_call_id 定位原步骤，并把状态、结果及媒体信息一起回填。
                   updateToolStep(event.tool_call_id, (tc) => {
                            let updatedArgs = tc.arguments
                     let imageUrl: string | undefined = tc.imageUrl
@@ -960,6 +981,7 @@ const ChatInterface = ({ initialCanvasId, theme, onToggleTheme, onSetTheme }: Ch
                   break
 
                 case 'error':
+                  // 这是 HTTP 成功建立连接后，后端通过流传来的业务异常，不等同于 fetch 抛错。
                   setMessages((prev) => {
                     const newMessages = [...prev]
                     const lastMessage = newMessages[newMessages.length - 1]

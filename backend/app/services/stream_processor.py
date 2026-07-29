@@ -1,5 +1,14 @@
-"""
-流式处理器 - 处理LangGraph的流式输出并转换为SSE格式
+"""将 LangGraph 流式输出转换为前端约定的 SSE 事件。
+
+LangGraph 在执行 ReAct Agent 时会产生多种 Python 对象，例如：
+
+- ``AIMessageChunk``：LLM 的增量文本或 Tool Call；
+- ``ToolMessage``：工具执行完成后的返回结果；
+- 完整状态或不同版本产生的 tuple/list 包装结构。
+
+本模块把这些内部对象统一转换为 ``delta``、``tool_call``、``tool_result``、
+``skill_matched``、``error`` 和 ``[DONE]`` 等文本事件，使 HTTP 路由和前端无需
+理解 LangGraph 的具体消息类型。
 """
 import json
 import logging
@@ -14,27 +23,37 @@ from langchain_core.messages import (
     ToolCall
 )
 
-# 配置日志
+# 日志格式由 main.py 统一配置，这里只取得当前模块的命名 logger。
 logger = logging.getLogger(__name__)
 
 
 class StreamProcessor:
-    """流式处理器 - 负责处理智能体的流式输出"""
+    """维护一轮 Agent 流的解析状态，并异步产出 SSE 字符串。"""
 
     def __init__(self, session_id: Optional[str] = None):
+        # session_id 当前主要作为本轮处理器的上下文标识保留。
         self.session_id = session_id
+        # 这两个字段为流内容/工具调用状态预留；当前主要逻辑使用下面的专用缓冲区。
         self.current_content = ""
         self.current_tool_calls = []
-        self.text_buffer = "" # 用于累积日志打印的文本缓冲区
-        self.tool_call_args: Dict[str, Dict[str, Any]] = {}  # 用于累积工具调用参数
-        self.tool_call_names: Dict[str, str] = {}  # 用于存储工具调用名称（key: tool_call_id, value: tool_name）
-        self.tool_call_args_buffer: Dict[str, str] = {}  # 用于累积参数JSON字符串（key: tool_call_id, value: 累积的JSON字符串）
-        self.skill_matched_emitted: set = set()  # 已发送过 skill_matched 事件的 tool_call_id 集合
-        # LangGraph 默认 recursion_limit=25，生成多张图会很容易超过这个步数导致报错
+        # 仅用于把零碎文本合并后打印日志，不影响发送给前端的逐块 delta。
+        self.text_buffer = ""
+        # Tool Call 参数可能跨多个模型 chunk 到达，按调用 ID 保存已解析的参数。
+        self.tool_call_args: Dict[str, Dict[str, Any]] = {}
+        # 参数分片常常不重复携带工具名，因此单独保存 tool_call_id -> tool_name 映射。
+        self.tool_call_names: Dict[str, str] = {}
+        # 字符串形式的 JSON 参数可能被拆成 '{"prompt":' 和 '"..."}'，先在这里拼接。
+        self.tool_call_args_buffer: Dict[str, str] = {}
+        # 同一次 read_skill_file 调用只向前端发送一次 Skill 命中提示。
+        self.skill_matched_emitted: set = set()
+        # recursion_limit 限制 LangGraph 节点执行步数，不是 Python 函数递归深度。
+        # 多工具工作流会反复经历“模型 -> 工具 -> 模型”，默认 25 步可能不足。
         self.recursion_limit = int(os.getenv("RECURSION_LIMIT", "200"))
 
     def _extract_skill_name(self, path: str) -> str:
-        """从 skill 文件路径中提取 skill 目录名（ID）"""
+        """从 SKILL.md 路径中提取 Skill 目录名，供 UI 显示命中状态。"""
+
+        # Windows 和 Unix 路径统一转成 / 后再按目录段处理。
         parts = path.replace("\\", "/").split("/")
         # 路径格式: custom/<skill-name>/SKILL.md 或 public/<skill-name>/...
         for i, part in enumerate(parts):
@@ -48,19 +67,23 @@ class StreamProcessor:
         return parts[-2] if len(parts) >= 2 else ""
 
     def _extract_skill_display_name(self, skill_id: str) -> str:
-        """通过 skill_id 查找可读的显示名称（来自 SKILL.md frontmatter name 字段）"""
+        """把目录 ID 转换为 SKILL.md frontmatter 中更适合展示的 name。"""
         try:
+            # 放在函数内部导入，避免模块加载阶段产生不必要的循环依赖。
             from app.services import skill_service
             skills = skill_service.get_skills_with_state()
             for s in skills:
                 if s.id == skill_id:
                     return s.name
         except Exception:
+            # Skill 扫描失败不应中断 Agent 主流；退化为展示目录 ID。
             pass
         return skill_id
 
     async def _maybe_emit_skill_matched(self, tool_name: str, tool_call_id: str, tool_args: dict) -> AsyncGenerator[str, None]:
-        """如果是 read_skill_file 且尚未发送过，则发送 skill_matched 事件"""
+        """在 Agent 首次读取某个 Skill 时产生一次 ``skill_matched`` 事件。"""
+
+        # “LLM 调用 read_skill_file”是确认真正选择了 Skill 的可靠信号；仅看用户文本不够。
         if tool_name == "read_skill_file" and tool_call_id not in self.skill_matched_emitted:
             skill_path = tool_args.get("path", "")
             skill_id = self._extract_skill_name(skill_path)
@@ -73,6 +96,7 @@ class StreamProcessor:
                     "tool_call_id": tool_call_id
                 }
                 self.skill_matched_emitted.add(tool_call_id)
+                # SSE 每条 data 事件以两个换行符结束，前端据此识别事件边界。
                 yield f"data: {json.dumps(skill_event, ensure_ascii=False)}\n\n"
 
     async def process_stream(
@@ -80,47 +104,51 @@ class StreamProcessor:
         agent: Any,
         messages: List[Dict[str, Any]]
     ) -> AsyncGenerator[str, None]:
-        """
-        处理整个流式响应
-        
+        """运行 Agent，规范化每个输出 chunk，并逐个产出 SSE 事件。
+
         Args:
-            agent: 编译后的LangGraph Agent
-            messages: 消息列表
-        
+            agent: ``create_react_agent`` 返回的已编译 LangGraph。
+            messages: 路由传入的 OpenAI 风格 ``role/content`` 字典列表。
+
         Yields:
-            SSE格式的事件字符串
+            可以直接交给 FastAPI ``StreamingResponse`` 的 SSE 文本块。
         """
         try:
             logger.info(f"🚀 开始处理流式响应，消息数量: {len(messages)}")
             
-            # 转换消息格式为LangChain格式
+            # LangGraph State 中的 messages 使用 LangChain 消息对象，而路由收到的是普通字典。
             langchain_messages = []
             for msg in messages:
                 if msg.get("role") == "user":
                     langchain_messages.append(HumanMessage(content=msg.get("content", "")))
                 elif msg.get("role") == "assistant":
                     langchain_messages.append(AIMessage(content=msg.get("content", "")))
+                # 其他 role 当前不会传入图，Tool 历史由本轮 LangGraph 执行时自行产生。
             
             logger.info(f"📨 转换后的消息数量: {len(langchain_messages)}")
             
-            # 开始流式处理 - 使用 messages 模式确保逐字符流式输出
-            # 关键：每个 chunk 立即 yield，不等待，类似 OpenAI 的流式输出
+            # astream 真正启动编译后的图，并在模型或工具产生新消息时异步交出 chunk。
+            # messages 模式关注消息增量，适合将 LLM 文本尽快转发给前端。
             chunk_count = 0
             try:
                 async for chunk in agent.astream(
+                    # 图的初始 State；create_react_agent 默认使用 messages 状态键。
                     {"messages": langchain_messages},
+                    # 第二个参数是 LangGraph 本轮运行配置。
                     {"recursion_limit": self.recursion_limit},
-                    stream_mode=["messages"]  # 使用列表格式，确保1流式输出
+                    # 使用列表形式指定模式时，不同 LangGraph 版本可能增加模式包装层，
+                    # 后面的 _handle_chunk 会兼容 tuple、list 和直接消息对象。
+                    stream_mode=["messages"]
                 ):
                     chunk_count += 1
                     logger.debug(f"📦 收到第 {chunk_count} 个 chunk: {type(chunk)}")
-                    # 立即处理并发送，不等待 - 确保真正的流式输出
+                    # 一个 LangGraph chunk 可能转换为零个、一个或多个前端事件。
                     event_count = 0
                     try:
                         async for event in self._handle_chunk(chunk):
                             event_count += 1
                             logger.debug(f"📤 发送第 {event_count} 个事件 (chunk {chunk_count}): {event[:100] if len(event) > 100 else event}")
-                            # 立即 yield，确保流式输出，不缓冲
+                            # 每转换出一个事件就立即向 agent_service 交出，不等待图执行结束。
                             yield event
                     except (GeneratorExit, StopAsyncIteration, ConnectionError, BrokenPipeError, OSError) as e:
                         # 客户端断开，停止处理
@@ -133,16 +161,17 @@ class StreamProcessor:
                 # 不继续处理，直接返回
                 return
 
-            # 发送完成事件
-            # 打印剩余的文本缓冲区
+            # 图自然结束后，先补打一段尚未达到日志分段阈值的文本。
             if self.text_buffer:
                 logger.info(f"🤖 AI回答(完): {self.text_buffer}")
                 self.text_buffer = ""
             
             logger.info("✅ 流式处理完成")
+            # [DONE] 是本项目约定的 SSE 流结束标记，不是 LangGraph 消息对象。
             yield "data: [DONE]\n\n"
 
         except Exception as e:
+            # 图运行、消息转换或事件序列化失败时，尽量把统一 error 事件交给前端。
             import traceback
             logger.error(f"❌ 流式处理错误: {str(e)}")
             logger.error(traceback.format_exc())
@@ -154,19 +183,18 @@ class StreamProcessor:
             yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
 
     async def _handle_chunk(self, chunk: Any) -> AsyncGenerator[str, None]:
-        """处理单个chunk"""
+        """把不同包装形式的 LangGraph chunk 统一分派到具体消息处理函数。"""
         try:
             logger.debug(f"🔍 处理 chunk: type={type(chunk)}, value={str(chunk)[:200]}")
             
-            # langgraph 1.0.0 的流式输出格式可能是多种形式
-            # 1. tuple 格式: (chunk_type, chunk_data)
+            # 兼容形式一：二元组，第一项是流模式/类型，第二项是对应数据。
             if isinstance(chunk, tuple) and len(chunk) == 2:
                 chunk_type = chunk[0]
                 chunk_data = chunk[1]
                 logger.debug(f"  📦 Tuple chunk: type={chunk_type}, data_type={type(chunk_data)}")
                 
                 if chunk_type == "values":
-                    # 处理完整状态更新
+                    # values 模式携带的是完整 State，而不是单个增量消息。
                     async for event in self._handle_values_chunk(chunk_data):
                         yield event
                 else:
@@ -187,13 +215,13 @@ class StreamProcessor:
                         logger.debug(f"  📨 单个消息对象")
                         async for event in self._handle_message_chunk(chunk_data):
                             yield event
-            # 2. 列表格式: [message1, message2, ...]
+            # 兼容形式二：直接返回消息列表。
             elif isinstance(chunk, list) and len(chunk) > 0:
                 logger.debug(f"  📋 直接列表格式，长度: {len(chunk)}")
                 for message in chunk:
                     async for event in self._handle_message_chunk(message):
                         yield event
-            # 3. 直接是消息对象
+            # 兼容形式三：直接返回 AIMessageChunk、ToolMessage 等单个对象。
             else:
                 logger.debug(f"  📨 直接消息对象")
                 async for event in self._handle_message_chunk(chunk):
@@ -209,11 +237,11 @@ class StreamProcessor:
             yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
 
     async def _handle_values_chunk(self, chunk_data: Dict[str, Any]) -> AsyncGenerator[str, None]:
-        """处理values类型的chunk - 包含完整消息状态"""
+        """把 values 模式携带的完整 LangGraph 消息状态转成一个 messages 事件。"""
         all_messages = chunk_data.get("messages", [])
         
         if all_messages:
-            # 转换为OpenAI格式
+            # LangChain 消息对象不能直接 JSON 序列化，先转为 OpenAI 风格字典。
             oai_messages = convert_to_openai_messages(all_messages)
             
             # 发送完整消息更新
@@ -224,13 +252,13 @@ class StreamProcessor:
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
     async def _handle_message_chunk(self, message_chunk: Any) -> AsyncGenerator[str, None]:
-        """处理消息类型的chunk"""
+        """将一个 LangChain 消息对象转换成文本、工具调用或工具结果事件。"""
         try:
-            # 处理工具消息
+            # ToolMessage 表示 ToolNode 已执行完某次调用，content 是 Tool 返回值。
             if isinstance(message_chunk, ToolMessage):
                 logger.info(f"🔧 工具调用结果: tool_call_id={message_chunk.tool_call_id}")
                 logger.info(f"   内容: {str(message_chunk.content)[:200]}")
-                # 清理已完成的工具调用参数和名称
+                # 工具已经完成，释放该 ID 的解析状态，避免影响之后的工具调用。
                 if message_chunk.tool_call_id in self.tool_call_args:
                     del self.tool_call_args[message_chunk.tool_call_id]
                 if message_chunk.tool_call_id in self.tool_call_names:
@@ -241,13 +269,13 @@ class StreamProcessor:
                     "content": message_chunk.content
                 }
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                # ToolMessage 已处理完成，不应继续按 AIMessageChunk 分支判断。
                 return
 
-            # 处理AI消息
+            # AIMessageChunk 既可能含增量自然语言，也可能含模型生成的 Tool Call。
             if isinstance(message_chunk, AIMessageChunk):
                 logger.debug(f"  🤖 AIMessageChunk: content={str(message_chunk.content)[:50] if message_chunk.content else None}")
-                # 处理文本内容 - 立即发送每个 chunk，类似 OpenAI 流式输出
-                # 关键：langgraph 的 AIMessageChunk 已经是增量内容，直接发送
+                # AIMessageChunk.content 本身就是增量，不要再次与历史文本做差分。
                 content = message_chunk.content
                 
                 # 如果 content 存在，立即发送（每个 chunk 都是增量）
@@ -259,7 +287,7 @@ class StreamProcessor:
                     if content_str:
                         logger.debug(f"📝 发送文本 delta ({len(content_str)} 字符): {content_str[:100]}")
                         
-                        # 累积到缓冲区用于日志打印
+                        # 日志缓冲只减少零碎日志数量，前端仍会收到每一个原始 delta。
                         self.text_buffer += content_str
                         # 如果遇到换行符或标点符号，且长度足够，则打印
                         if "\n" in self.text_buffer or (len(self.text_buffer) > 50 and any(p in self.text_buffer for p in "。！？.!?")):
@@ -273,14 +301,14 @@ class StreamProcessor:
                             "type": "delta",
                             "content": content_str
                         }
-                        # 立即 yield，不等待
+                        # 将 Python 字典序列化成 SSE data 行。
                         event_str = f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                         logger.debug(f"📤 发送事件字符串: {event_str[:100]}")
                         yield event_str
                 else:
                     logger.debug(f"  ⚠️  AIMessageChunk 没有内容")
 
-                # 处理工具调用
+                # tool_calls 通常是已经聚合出的调用对象，但不同模型适配器返回格式不同。
                 if hasattr(message_chunk, "tool_calls") and message_chunk.tool_calls:
                     for tool_call in message_chunk.tool_calls:
                         # 处理不同的工具调用格式
@@ -306,17 +334,16 @@ class StreamProcessor:
                                     tool_args = {}
                             logger.debug(f"📋 对象格式工具调用: id={tool_call_id}, name={tool_name}, args={tool_args}, args类型={type(tool_args)}, 对象类型={type(tool_call)}")
                         
-                        # 关键修复：严格检查 name 是否存在且非空
-                        # 在流式输出中，某些 chunk 可能包含 name 为空或 None 的 tool_call
+                        # 流式 Tool Call 的中间 chunk 可能尚未携带 name 或 id，暂时跳过。
                         if not tool_name or not tool_call_id:
                             logger.debug(f"⚠️  跳过无效的工具调用 (name或id为空): name={tool_name}, id={tool_call_id}")
                             continue
                         
-                        # 存储工具调用名称（用于后续在tool_call_chunks中获取）
+                        # 后续 tool_call_chunks 可能只有参数，没有名称，需要通过 ID 找回。
                         if tool_name:
                             self.tool_call_names[tool_call_id] = tool_name
 
-                        # 处理参数：如果是字符串（JSON格式），需要解析
+                        # 有的 Provider 返回 dict，有的返回 JSON 字符串，这里统一为 dict。
                         if isinstance(tool_args, str):
                             try:
                                 tool_args = json.loads(tool_args)
@@ -328,7 +355,7 @@ class StreamProcessor:
                             tool_args = {}
                             logger.debug(f"⚠️  工具参数为None，使用空字典")
 
-                        # 累积工具调用参数（流式输出中参数可能分多个chunk）
+                        # 为本次调用建立参数字典；后续同 ID 的参数会合并进来。
                         if tool_call_id not in self.tool_call_args:
                             self.tool_call_args[tool_call_id] = {}
                         
@@ -340,14 +367,12 @@ class StreamProcessor:
                         # 使用累积的参数
                         final_args = self.tool_call_args[tool_call_id]
 
-                        # 只有当参数非空时才输出工具调用事件
-                        # 避免在流式传输中发送多次相同的工具调用（参数空 -> 参数完整）
-                        # 参数会在 tool_call_chunks 处理完成后统一发送
+                        # 空参数常表示调用尚未流完，此时先等待，避免前端显示无效调用。
                         if final_args:
                             logger.info(f"🛠️  工具调用: name={tool_name}, id={tool_call_id}")
                             logger.info(f"   参数: {final_args}")
 
-                            # 如果是 read_skill_file，先发送 skill_matched 事件
+                            # Skill UI 事件必须先于 read_skill_file 的普通 tool_call 事件。
                             async for ev in self._maybe_emit_skill_matched(tool_name, tool_call_id, final_args):
                                 yield ev
 
@@ -361,7 +386,7 @@ class StreamProcessor:
                         else:
                             logger.debug(f"⏳ 工具调用参数为空，等待后续chunk补充: name={tool_name}, id={tool_call_id}")
                 
-                # 处理工具调用参数流（如果存在）
+                # tool_call_chunks 是更底层的参数增量，例如 JSON 字符串的一小段。
                 if hasattr(message_chunk, "tool_call_chunks") and message_chunk.tool_call_chunks:
                     for tool_call_chunk in message_chunk.tool_call_chunks:
                         # 处理可能的字典或对象
@@ -379,8 +404,7 @@ class StreamProcessor:
                         tc_id = chunk_dict.get("id")
                         tool_name_from_chunk = chunk_dict.get("name")
                         
-                        # 如果 chunk 中没有 id，尝试从 tool_call_names 中查找（通过 index）
-                        # 或者使用最近创建的 tool_call_id
+                        # 某些 Provider 只在首个分片发送 ID；缺失时退化为最近记录的调用。
                         if not tc_id:
                             # 尝试从已存储的 tool_call_names 中获取（如果有多个，使用最后一个）
                             if self.tool_call_names:
@@ -388,13 +412,13 @@ class StreamProcessor:
                                 tc_id = list(self.tool_call_names.keys())[-1] if self.tool_call_names else None
                                 logger.debug(f"⚠️  chunk中没有id，使用最近的tool_call_id: {tc_id}")
                         
-                        # 累积参数JSON字符串片段
+                        # 只有同时存在参数内容和可关联的调用 ID 才能继续处理。
                         if args_chunk and tc_id:
                             # 初始化缓冲区
                             if tc_id not in self.tool_call_args_buffer:
                                 self.tool_call_args_buffer[tc_id] = ""
                             
-                            # 累积字符串片段
+                            # 字符串参数要一直拼到成为合法完整 JSON 后才能通知前端。
                             if isinstance(args_chunk, str):
                                 self.tool_call_args_buffer[tc_id] += args_chunk
                                 
@@ -428,10 +452,10 @@ class StreamProcessor:
                                             }
                                             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                                 except json.JSONDecodeError:
-                                    # JSON 还不完整，继续累积
+                                    # 这通常不是错误，只表示后续 chunk 尚未到达。
                                     pass
                             elif isinstance(args_chunk, dict):
-                                # 如果已经是字典，直接更新
+                                # 已经结构化的参数无需字符串缓冲，直接按键合并。
                                 if tc_id not in self.tool_call_args:
                                     self.tool_call_args[tc_id] = {}
                                 self.tool_call_args[tc_id].update(args_chunk)
@@ -455,8 +479,7 @@ class StreamProcessor:
                                     }
                                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                         
-                        # 发送参数流事件给前端（用于实时显示参数输入，可选）
-                        # 注释掉以减少日志噪音
+                        # 项目当前只展示完整参数，因此原始 tool_call_chunk 事件保持关闭。
                         # if args_chunk:
                         #     event = {
                         #         "type": "tool_call_chunk",

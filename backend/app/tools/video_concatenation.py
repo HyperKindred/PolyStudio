@@ -1,5 +1,16 @@
-"""
-视频拼接工具 - 将多个视频片段拼接为一个完整视频
+"""将多个视频片段按顺序拼接为一个 MP4 的 LangChain Tool。
+
+本模块分为两层：
+
+``concatenate_videos``
+    业务实现层，负责把本地路径、localhost URL 或公网 URL 统一为本地文件，
+    使用 MoviePy 对齐分辨率和帧率，然后编码输出 MP4。
+
+``concatenate_videos_tool``
+    Agent 适配层，通过 Pydantic Schema 和 ``@tool`` 向 LLM 暴露参数，并把成功
+    或失败结果统一序列化为 JSON 字符串。
+
+该工具只做顺序拼接，没有加入淡入淡出等显式转场效果。
 """
 import json
 import logging
@@ -16,20 +27,21 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
-# 优先加载 backend/.env（避免直接运行工具脚本时环境未加载）
+# 工具可能由 FastAPI 导入，也可能单独运行，因此主动定位并加载 backend/.env。
 BASE_DIR = Path(__file__).parent.parent.parent
 ENV_PATH = BASE_DIR / ".env"
 if ENV_PATH.exists():
     load_dotenv(ENV_PATH)
 
-# 视频存储目录
+# 所有下载的输入片段和最终输出都放在 backend/storage/videos。
+# main.py 将 storage 挂载为静态目录，因此输出可以通过 /storage/videos/... 访问。
 STORAGE_DIR = BASE_DIR / "storage"
 VIDEOS_DIR = STORAGE_DIR / "videos"
 
 # 确保视频存储目录存在
 VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Mock 模式配置（需要在 VIDEOS_DIR 定义之后）
+# Mock 模式跳过下载、MoviePy 和编码，直接返回固定路径，用于离线测试 Agent 调用链。
 MOCK_MODE = os.getenv("MOCK_MODE", "false").lower() == "true"
 # Mock 视频路径（启用 MOCK_MODE 时必须配置）
 MOCK_VIDEO_PATH = os.getenv("MOCK_VIDEO_PATH", "").strip()
@@ -39,7 +51,8 @@ if MOCK_MODE and not MOCK_VIDEO_PATH:
         "请在 backend/.env 中设置 MOCK_VIDEO_PATH=/storage/videos/your_video.mp4"
     )
 
-# 尝试导入 moviepy（兼容 1.x / 2.x）
+# MoviePy 1.x 和 2.x 的导入路径、部分方法名不同，后续代码同时兼容两代 API。
+# 导入失败不会阻止整个后端启动，只把当前 Tool 标记为不可用。
 try:
     # moviepy 2.x 推荐直接从 moviepy 导入
     from moviepy import VideoFileClip, concatenate_videoclips
@@ -68,7 +81,7 @@ def prepare_video_path(video_url: str) -> Path:
         FileNotFoundError: 本地文件不存在
         ValueError: URL 下载失败
     """
-    # 检查是否是本地路径
+    # 情况一：应用内部的 /storage URL。去掉开头 / 后与 backend 根目录拼接。
     if video_url.startswith("/storage/"):
         file_path = BASE_DIR / video_url.lstrip("/")
         if not file_path.exists():
@@ -76,7 +89,8 @@ def prepare_video_path(video_url: str) -> Path:
         logger.info(f"📁 使用本地文件: {file_path}")
         return file_path
     
-    # 检查是否是 localhost URL
+    # 情况二：localhost 完整 URL 实际仍指向本项目文件，直接映射磁盘路径，
+    # 避免后端通过 HTTP 再请求自己一次。
     if video_url.startswith("http://localhost") or video_url.startswith("http://127.0.0.1"):
         # 提取路径部分
         parsed_url = urlparse(video_url)
@@ -87,20 +101,22 @@ def prepare_video_path(video_url: str) -> Path:
                 logger.info(f"📁 从 localhost URL 转换为本地路径: {file_path}")
                 return file_path
     
-    # 如果是公网 URL，需要下载
+    # 情况三：其余值按公网 URL 处理，先下载成本地文件再交给 MoviePy。
     logger.info(f"📥 下载视频: {video_url}")
     try:
+        # stream=True 不一次性把整个视频读进内存；300 秒适配较大的远端视频。
         response = requests.get(video_url, timeout=300, stream=True)
+        # 将 4xx/5xx 响应转换成异常，进入统一下载失败分支。
         response.raise_for_status()
         
-        # 生成临时文件名
+        # URL 路径没有扩展名时默认按 mp4 保存；时间戳和 UUID 避免重名。
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = str(uuid.uuid4())[:8]
         ext = os.path.splitext(urlparse(video_url).path)[1] or ".mp4"
         filename = f"temp_{timestamp}_{unique_id}{ext}"
         temp_path = VIDEOS_DIR / filename
         
-        # 保存到临时文件
+        # 分块写入能控制内存占用，适合体积较大的视频文件。
         with open(temp_path, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
@@ -132,43 +148,46 @@ def concatenate_videos(
         ValueError: 如果 moviepy 未安装或视频列表为空
         FileNotFoundError: 如果视频文件不存在
     """
+    # 业务函数也自行校验依赖，因此即使绕过 Tool 包装层直接调用也有明确错误。
     if not MOVIEPY_AVAILABLE:
         raise ValueError(
             "moviepy 未安装，无法拼接视频。"
             "请运行: pip install moviepy"
         )
     
+    # 单个视频不需要拼接，同时避免 MoviePy 对空列表产生难以理解的异常。
     if not video_urls or len(video_urls) < 2:
         raise ValueError("至少需要2个视频片段才能拼接")
     
     try:
         logger.info(f"🎬 开始拼接 {len(video_urls)} 个视频片段")
         
-        # 准备所有视频文件路径
+        # 第一阶段：把三类输入地址全部标准化为存在的本地 Path。
         video_paths = []
         for i, video_url in enumerate(video_urls, 1):
             logger.info(f"  处理片段 {i}/{len(video_urls)}: {video_url}")
             video_path = prepare_video_path(video_url)
             video_paths.append(video_path)
         
-        # 加载所有视频片段
+        # 第二阶段：打开视频文件，并以第一个片段作为输出规格基准。
         clips = []
+        # first_clip 当前只用于保留首片段引用；目标规格由 target_size/target_fps 保存。
         first_clip = None
         for i, video_path in enumerate(video_paths):
             logger.info(f"  加载视频片段 {i+1}: {video_path}")
             clip = VideoFileClip(str(video_path))
             
-            # 记录第一个视频的分辨率和帧率（用于统一）
+            # 第一个视频决定最终分辨率和帧率，后续片段向它对齐。
             if i == 0:
                 first_clip = clip
                 target_size = clip.size
                 target_fps = clip.fps
                 logger.info(f"  目标分辨率: {target_size}, 帧率: {target_fps}")
             
-            # 统一分辨率和帧率（如果需要）
+            # 分辨率或 FPS 不一致可能导致直接拼接失败或输出节奏异常，因此先标准化。
             if clip.size != target_size or clip.fps != target_fps:
                 logger.info(f"  调整视频 {i+1} 的分辨率和帧率: {clip.size} -> {target_size}, {clip.fps} -> {target_fps}")
-                # moviepy 2.x 使用 resized/with_fps；1.x 使用 resize/set_fps
+                # 通过 hasattr 在运行时适配 MoviePy 2.x 和 1.x 的不同方法名。
                 if hasattr(clip, "resized"):
                     clip = clip.resized(target_size)
                 else:
@@ -180,23 +199,24 @@ def concatenate_videos(
             
             clips.append(clip)
         
-        # 拼接视频
+        # 第三阶段：按照 video_urls 原始顺序拼接。compose 能兼容片段属性差异，
+        # 但前面仍主动统一尺寸和 FPS，使输出更可控。
         logger.info("  正在拼接视频片段...")
         final_clip = concatenate_videoclips(clips, method="compose")
         
-        # 生成输出文件名
+        # 调用方未指定名称时生成唯一、可识别的 mp4 文件名。
         if not output_filename:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             unique_id = str(uuid.uuid4())[:8]
             output_filename = f"concatenated_{timestamp}_{unique_id}.mp4"
         
-        # 确保输出文件名有扩展名
+        # 当前编码参数固定输出 MP4，因此统一补充 .mp4 后缀。
         if not output_filename.endswith(".mp4"):
             output_filename += ".mp4"
         
         output_path = VIDEOS_DIR / output_filename
         
-        # 写入文件
+        # 第四阶段：重新编码为浏览器普遍支持的 H.264 视频 + AAC 音频。
         logger.info(f"  正在保存拼接后的视频: {output_path}")
         final_clip.write_videofile(
             str(output_path),
@@ -206,12 +226,12 @@ def concatenate_videos(
             preset="medium"
         )
         
-        # 清理资源
+        # VideoFileClip 持有文件句柄和 ffmpeg 资源，编码结束后必须主动关闭。
         for clip in clips:
             clip.close()
         final_clip.close()
         
-        # 返回HTTP访问路径
+        # 对上层返回 HTTP 静态资源路径，而不是暴露 Windows 绝对磁盘路径。
         http_path = f"/storage/videos/{output_filename}"
         logger.info(f"✅ 视频拼接完成: {http_path}")
         logger.info(f"   总时长: {final_clip.duration:.2f}秒")
@@ -227,7 +247,9 @@ def concatenate_videos(
 
 
 class ConcatenateVideosInput(BaseModel):
-    """视频拼接输入参数"""
+    """Agent 调用视频拼接 Tool 时使用的参数 Schema。"""
+
+    # 字段 description 会进入 Tool 定义，帮助 LLM 正确排列路径和选择可选文件名。
     video_urls: List[str] = Field(description="视频路径列表，按顺序拼接。支持本地路径（如 /storage/videos/xxx.mp4）或 URL")
     output_filename: Optional[str] = Field(default=None, description="输出文件名（可选，如果不提供则自动生成）")
 
@@ -270,7 +292,8 @@ def concatenate_videos_tool(
     Returns:
         拼接后的视频路径的JSON字符串（格式：{"video_url": "/storage/videos/xxx.mp4", ...}）
     """
-    # Mock 模式：直接返回固定的视频路径
+    # @tool 将普通 Python 函数包装成 LangChain Tool；名称和函数 docstring 会暴露给 LLM。
+    # Mock 与真实分支返回相同的核心字段，前端和后续 Tool 无需区分处理。
     if MOCK_MODE:
         logger.info(f"🎭 [MOCK模式] 拼接视频: {len(video_urls)} 个片段")
         result = {
@@ -284,6 +307,7 @@ def concatenate_videos_tool(
         return json.dumps(result, ensure_ascii=False)
     
     try:
+        # Tool 层把依赖错误转成 JSON，而不是抛出异常终止整个 ReAct 图。
         if not MOVIEPY_AVAILABLE:
             error_msg = "moviepy 未安装，无法拼接视频。请运行: pip install moviepy"
             logger.error(error_msg)
@@ -293,10 +317,10 @@ def concatenate_videos_tool(
         
         logger.info(f"🎬 开始拼接 {len(video_urls)} 个视频片段")
         
-        # 拼接视频
+        # 具体路径准备、规格对齐和编码全部委托给业务实现函数。
         output_path = concatenate_videos(video_urls, output_filename)
         
-        # 构建返回结果
+        # LangChain 会把这个 JSON 字符串放入 ToolMessage.content，模型和前端均可解析。
         result = {
             'video_url': output_path,
             'local_path': output_path,
@@ -308,6 +332,7 @@ def concatenate_videos_tool(
         return json.dumps(result, ensure_ascii=False)
         
     except Exception as e:
+        # 业务函数保留异常语义，Tool 包装层再统一转换成模型可读取的错误 JSON。
         error_msg = f"视频拼接失败: {str(e)}"
         logger.error(error_msg)
         import traceback
@@ -318,7 +343,7 @@ def concatenate_videos_tool(
 
 
 if __name__ == "__main__":
-    # 简单测试示例（使用写死的本地视频列表）
+    # 直接运行文件时执行本地冒烟测试；被 agent_service 导入时不会进入此分支。
     import sys
 
     # 加载环境变量

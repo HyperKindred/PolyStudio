@@ -161,7 +161,7 @@ POST /api/chat JSON
 | `tool_result` | 工具执行后返回的结果 |
 | `skill_matched` | Agent 判断应加载某个 Skill |
 | `error` | Agent、模型或工具执行异常 |
-| `[DONE]` | 本轮流式响应结束 |
+| `[DONE  ]` | 本轮流式响应结束 |
 
 这部分代码较复杂。第一遍只追踪一种文本 `delta` 和一次完整的 `tool_call -> tool_result`，之后再看参数分片兼容逻辑。
 
